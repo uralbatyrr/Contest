@@ -27,48 +27,58 @@ class FunctionBase<Copyable, Derived, Ret(Args...)> {
 
   struct Operations {
     void (*destroy)(void*);
-    void* (*move)(void*, void*);
-    void* (*copy)(const void*, void*);
+    void (*move)(void*, void*);
+    void (*copy)(void*, void*);
     const std::type_info& (*type)();
   };
 
   template <typename F>
-  static Ret Invoke(void* object, Args... args) {
+  static F* Object(void* buffer) {
+    if constexpr (kIsSmall<F>) {
+      return static_cast<F*>(buffer);
+    } else {
+      return *static_cast<F**>(buffer);
+    }
+  }
+
+  template <typename F, typename G>
+  static void Construct(void* buffer, G&& value) {
+    if constexpr (kIsSmall<F>) {
+      new (buffer) F(std::forward<G>(value));
+    } else {
+      new (buffer) F*(new F(std::forward<G>(value)));
+    }
+  }
+
+  template <typename F>
+  static Ret Invoke(void* buffer, Args... args) {
     return static_cast<Ret>(
-        std::invoke(*static_cast<F*>(object), std::forward<Args>(args)...));
+        std::invoke(*Object<F>(buffer), std::forward<Args>(args)...));
   }
 
   template <typename F>
-  static void Destroy(void* object) {
+  static void Destroy(void* buffer) {
     if constexpr (kIsSmall<F>) {
-      static_cast<F*>(object)->~F();
+      Object<F>(buffer)->~F();
     } else {
-      delete static_cast<F*>(object);
+      delete Object<F>(buffer);
     }
   }
 
   template <typename F>
-  static void* Move(void* object, void* buffer) {
+  static void Move(void* source, void* buffer) {
     if constexpr (kIsSmall<F>) {
-      F* moved = new (buffer) F(std::move(*static_cast<F*>(object)));
-      static_cast<F*>(object)->~F();
-      return moved;
+      new (buffer) F(std::move(*Object<F>(source)));
+      Object<F>(source)->~F();
     } else {
-      return object;
+      new (buffer) F*(Object<F>(source));
     }
   }
 
   template <typename F>
-  static void* Copy(const void* object, void* buffer) {
+  static void Copy(void* source, void* buffer) {
     if constexpr (Copyable) {
-      const F& source = *static_cast<const F*>(object);
-      if constexpr (kIsSmall<F>) {
-        return new (buffer) F(source);
-      } else {
-        return new F(source);
-      }
-    } else {
-      return nullptr;
+      Construct<F>(buffer, *Object<F>(source));
     }
   }
 
@@ -81,27 +91,25 @@ class FunctionBase<Copyable, Derived, Ret(Args...)> {
   static constexpr Operations kOperations = {&Destroy<F>, &Move<F>, &Copy<F>,
                                              &Type<F>};
 
-  alignas(std::max_align_t) char buffer_[kBufferSize];
-  void* object_ = nullptr;
+  alignas(std::max_align_t) mutable char buffer_[kBufferSize];
   Ret (*invoke_)(void*, Args...) = nullptr;
   const Operations* operations_ = nullptr;
 
   void Reset() {
-    object_ = nullptr;
     invoke_ = nullptr;
     operations_ = nullptr;
   }
 
   void Clear() {
-    if (object_ != nullptr) {
-      operations_->destroy(object_);
+    if (invoke_ != nullptr) {
+      operations_->destroy(buffer_);
     }
     Reset();
   }
 
   void Adopt(FunctionBase&& other) {
-    if (other.object_ != nullptr) {
-      object_ = other.operations_->move(other.object_, buffer_);
+    if (other.invoke_ != nullptr) {
+      other.operations_->move(other.buffer_, buffer_);
     }
     invoke_ = other.invoke_;
     operations_ = other.operations_;
@@ -117,19 +125,15 @@ class FunctionBase<Copyable, Derived, Ret(Args...)> {
     requires kIsCallable<F>
   FunctionBase(F&& function) {
     using Stored = std::decay_t<F>;
-    if constexpr (kIsSmall<Stored>) {
-      object_ = new (buffer_) Stored(std::forward<F>(function));
-    } else {
-      object_ = new Stored(std::forward<F>(function));
-    }
+    Construct<Stored>(buffer_, std::forward<F>(function));
     invoke_ = &Invoke<Stored>;
     operations_ = &kOperations<Stored>;
   }
 
   FunctionBase(const FunctionBase& other)
       : invoke_(other.invoke_), operations_(other.operations_) {
-    if (other.object_ != nullptr) {
-      object_ = operations_->copy(other.object_, buffer_);
+    if (invoke_ != nullptr) {
+      operations_->copy(other.buffer_, buffer_);
     }
   }
 
@@ -166,28 +170,28 @@ class FunctionBase<Copyable, Derived, Ret(Args...)> {
   ~FunctionBase() { Clear(); }
 
   Ret operator()(Args... args) const {
-    if (object_ == nullptr) {
+    if (invoke_ == nullptr) {
       throw std::bad_function_call();
     }
-    return invoke_(object_, std::forward<Args>(args)...);
+    return invoke_(buffer_, std::forward<Args>(args)...);
   }
 
-  explicit operator bool() const { return object_ != nullptr; }
+  explicit operator bool() const { return invoke_ != nullptr; }
 
-  bool operator==(std::nullptr_t) const { return object_ == nullptr; }
+  bool operator==(std::nullptr_t) const { return invoke_ == nullptr; }
 
   template <typename F>
   F* Target() {
-    return TargetType() == typeid(F) ? static_cast<F*>(object_) : nullptr;
+    return TargetType() == typeid(F) ? Object<F>(buffer_) : nullptr;
   }
 
   template <typename F>
   const F* Target() const {
-    return TargetType() == typeid(F) ? static_cast<const F*>(object_) : nullptr;
+    return TargetType() == typeid(F) ? Object<F>(buffer_) : nullptr;
   }
 
   const std::type_info& TargetType() const {
-    return object_ != nullptr ? operations_->type() : typeid(void);
+    return invoke_ != nullptr ? operations_->type() : typeid(void);
   }
 };
 
